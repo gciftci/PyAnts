@@ -1,0 +1,471 @@
+from asyncio.sslproto import add_flowcontrol_defaults
+import pygame
+import random
+import math
+import numpy as np
+
+# Globals
+# General
+SCREEN = (2000, 1000)
+FPS = 60
+DEBUG = False
+# Nest settings
+NEST_RADIUS = 40
+# Food source settings
+FOOD_SOURCE_COUNT = 5
+FOOD_SOURCE_RADIUS = 15
+# Pheromone grid settings
+GRID_SIZE = 1
+# Ant settings
+ANTS_COUNT = 1000
+ANT_SPEED = 5
+ANT_TURN_RATE = 0.1
+ANT_RND_RATE = 0.2
+ANT_VIEW_DISTANCE = 25
+ANT_COLOR = (255, 255, 255)
+ANT_RADIUS = 5
+# Pheromone settings
+PHEROMONE_DECAY_RATE = 2
+PHEROMONE_SIZE = 1
+
+
+# init
+pygame.init()
+screen = pygame.display.set_mode(SCREEN)
+clock = pygame.time.Clock()
+
+
+class Quadtree:
+    """
+    Quadtree for faster food/trail_nearby searches
+    """
+
+    def __init__(self, x, y, width, height, max_depth, max_items):
+        self.bounds = pygame.Rect(x, y, width, height)
+        self.max_depth = max_depth
+        self.max_items = max_items
+        self.items = []
+        self.children = []
+
+    def insert(self, item, rect):
+        if not self.bounds.colliderect(rect):
+            return False
+        if len(self.children) == 0 and (len(self.items) < self.max_items or
+                                        self.max_depth <= 0):
+            self.items.append((item, rect))
+            return True
+        if len(self.children) == 0:
+            self._subdivide()
+        return any(child.insert(item, rect) for child in self.children)
+
+    def retrieve(self, rect):
+        if not self.bounds.colliderect(rect):
+            return []
+        items = self.items.copy()
+        if len(self.children) > 0:
+            for child in self.children:
+                items.extend(child.retrieve(rect))
+        return items
+
+    def _subdivide(self):
+        x, y, width, height = self.bounds
+        half_width, half_height = width // 2, height // 2
+        self.children = [
+            Quadtree(x, y, half_width, half_height,
+                     self.max_depth - 1, self.max_items),
+            Quadtree(x + half_width, y, half_width, half_height,
+                     self.max_depth - 1, self.max_items),
+            Quadtree(x, y + half_height, half_width, half_height,
+                     self.max_depth - 1, self.max_items),
+            Quadtree(x + half_width, y + half_height, half_width,
+                     half_height, self.max_depth - 1, self.max_items)
+        ]
+        for item, rect in self.items:
+            for child in self.children:
+                if child.insert(item, rect):
+                    break
+        self.items.clear()
+
+
+class FoodSource:
+    def __init__(self, x: int, y: int):
+        """
+        Initialize a FoodSource object.
+
+        Parameters
+        ----------
+        x : int
+            The x-coordinate of the food source.
+        y : int
+            The y-coordinate of the food source.
+        """
+        self.x = x
+        self.y = y
+        self.radius = FOOD_SOURCE_RADIUS
+
+    def draw(self, screen: pygame.Surface):
+        """
+        Draw the food source on the given screen.
+
+        Parameters
+        ----------
+        screen : pygame.Surface
+            The surface to draw the food source on.
+        """
+        pygame.draw.circle(screen, (255, 255, 0),
+                           (self.x, self.y), self.radius)
+
+
+class Nest:
+    def __init__(self, x: int, y: int):
+        """
+        Initialize a Nest object.
+
+        Parameters
+        ----------
+        x : int
+            The x-coordinate of the nest.
+        y : int
+            The y-coordinate of the nest.
+        """
+        self.x = x
+        self.y = y
+        self.radius = NEST_RADIUS
+
+    def draw(self, screen: pygame.Surface):
+        """
+        Draw the nest on the given screen.
+
+        Parameters
+        ----------
+        screen : pygame.Surface
+            The surface to draw the nest on.
+        """
+        pygame.draw.circle(screen, (255, 0, 0), (self.x, self.y), self.radius)
+
+
+class PheromoneGrid:
+    def __init__(self):
+        """
+        Initialize a PheromoneGrid object.
+        """
+        self.grid_nest = np.zeros((SCREEN[0], SCREEN[1]), dtype=np.uint16)
+        self.grid_food = np.zeros((SCREEN[0], SCREEN[1]), dtype=np.uint16)
+        self.surface_nest = pygame.Surface(
+            (SCREEN[0], SCREEN[1]), flags=pygame.SRCALPHA)
+        self.surface_food = pygame.Surface(
+            (SCREEN[0], SCREEN[1]), flags=pygame.SRCALPHA)
+        self.updated_cells = set()
+        self.counter = 0
+        self.oldX, self.oldY = 0, 0
+
+    def update(self):
+        """
+        Update the given surface based on the pheromone grid.
+        """
+        new_updated_cells = set()
+        for x, y in self.updated_cells:
+            for grid, surface in [(self.grid_nest, self.surface_nest),
+                                  (self.grid_food, self.surface_food)]:
+                if grid[x][y] > 0:
+                    if surface == self.surface_nest:
+                        grid[x][y] *= (1-(PHEROMONE_DECAY_RATE/100))
+                    else:
+                        grid[x][y] *= (1-(PHEROMONE_DECAY_RATE/250))
+
+                color = (0, 0, 255, grid[x][y]) if surface == self.surface_nest else (
+                    0, 255, 0, grid[x][y])
+                pygame.draw.circle(surface, color, (x, y), PHEROMONE_SIZE)
+                new_updated_cells.add((x, y))
+
+            self.updated_cells = new_updated_cells
+
+    def draw(self, screen: pygame.Surface):
+        """
+        Draw the pheromone surfaces on the given screen.
+
+        Parameters
+        ----------
+        screen : pygame.Surface
+            The surface to draw the pheromones on.
+        """
+        screen.blit(self.surface_nest, (0, 0))
+        screen.blit(self.surface_food, (0, 0))
+
+
+class Ant:
+    def __init__(self, x: int, y: int):
+        """
+        Initialize an Ant object.
+
+        Parameters
+        ----------
+        x : int
+            The x-coordinate of the ant.
+        y : int
+            The y-coordinate of the ant.
+        """
+        self.x = x
+        self.y = y
+        self.angle = random.uniform(0, 2 * math.pi)
+        self.desired_angle = self.angle + \
+            random.uniform(-ANT_TURN_RATE, ANT_TURN_RATE)
+        self.carrying_food = False
+        self.mode = "looking_for_food"
+        self.speed = ANT_SPEED
+        self.view_distance = ANT_VIEW_DISTANCE
+        self.color = ANT_COLOR
+        self.radius = ANT_RADIUS
+        self.wall = False
+        self.food_distance_threshold = 1
+
+    def update(self, food_sources: list[FoodSource],
+               pheromone_grid: PheromoneGrid, quadtree: Quadtree):
+        """
+        Update the ant's state, including position, angle, and mode.
+
+        Parameters
+        ----------
+        food_sources : list[FoodSource]
+            The list of food sources.
+        pheromone_grid : PheromoneGrid
+            The pheromone grid.
+        """
+        self.detect_food(food_sources, quadtree)
+        new_x = self.x + ANT_SPEED * math.cos(self.angle)
+        new_y = self.y + ANT_SPEED * math.sin(self.angle)
+        self.angle += random.uniform(-ANT_RND_RATE, ANT_RND_RATE)
+
+        if 0 <= new_x < SCREEN[0]:  # Ant is inside (X-Axis)
+            self.x = new_x
+            self.wall = False
+        else:                       # Ant hit Wall (X-Axis)
+            self.desired_angle = math.pi - self.desired_angle
+            self.wall = True
+
+        if 0 <= new_y < SCREEN[1]:  # Ant is inside (Y-Axis)
+            self.y = new_y
+            self.wall = False
+        else:                       # Ant hit Wall (Y-Axis)
+            self.desired_angle = -self.desired_angle
+            self.wall = True
+
+        if self.mode == "got_food_trying_to_return_home" and self.carrying_food:
+            self.desired_angle = self.angle + math.pi
+            self.carrying_food = False
+        else:
+            self.angle += (self.desired_angle - self.angle) * ANT_TURN_RATE
+
+        self.leave_pheromone_trail(pheromone_grid)
+        self.detect_nest()
+        self.set_desired_direction_from_pheromones(
+            pheromone_grid, quadtree=quadtree)
+
+    def draw(self, screen: pygame.Surface):
+        """
+        Draw the ant on the given screen.
+
+        Parameters
+        ----------
+        screen : pygame.Surface
+            The surface to draw the ant on.
+        """
+        pygame.draw.circle(screen, self.color, (self.x, self.y), self.radius)
+
+        # Draw perspective line
+        if self.mode == 'looking_for_food':
+            line_color = (0, 0, 255)  # Blue
+        elif self.mode == 'got_food_trying_to_return_home':
+            line_color = (0, 255, 0)  # Green
+        if self.wall:
+            line_color = (255, 0, 0)  # Red
+
+        if DEBUG:
+            # Draw cone of view
+            # Change this value to adjust the cone angle
+            cone_angle = math.pi / 8
+            cone_length = self.view_distance
+
+            left_angle = self.angle - cone_angle / 2
+            right_angle = self.angle + cone_angle / 2
+
+            left_x = self.x + cone_length * math.cos(left_angle)
+            left_y = self.y + cone_length * math.sin(left_angle)
+
+            right_x = self.x + cone_length * math.cos(right_angle)
+            right_y = self.y + cone_length * math.sin(right_angle)
+
+            pygame.draw.polygon(screen, line_color, [
+                                (self.x, self.y), (left_x, left_y),
+                                (right_x, right_y)], 1)
+
+    def distance(self, x1: float, y1: float, x2: float, y2: float) -> float:
+        """
+        Calculate the distance between two points (x1, y1) and (x2, y2).
+
+        Parameters
+        ----------
+        x1 : float
+            The x-coordinate of the first point.
+        y1 : float
+            The y-coordinate of the first point.
+        x2 : float
+            The x-coordinate of the second point.
+        y2 : float
+            The y-coordinate of the second point.
+
+        Returns
+        -------
+        float
+            The distance between the two points.
+        """
+        return np.sqrt((x1 - x2) ** 2 + (y1 - y2) ** 2)
+
+    def detect_food(self, food_sources: list[FoodSource], quadtree: Quadtree):
+        """
+        Detect food sources and update the ant's state accordingly.
+
+        Parameters
+        ----------
+        food_sources : list[FoodSource]
+            The list of food sources.
+        """
+        query_rect = pygame.Rect(self.x - 20, self.y - 20, 40, 40)
+        nearby_items = quadtree.retrieve(query_rect)
+        nearby_food_rects = [
+            rect for item, rect in nearby_items if
+            isinstance(item, FoodSource)]
+
+        for food in food_sources:
+            food_rect = pygame.Rect(
+                food.x - food.radius, food.y - food.radius,
+                2 * food.radius, 2 * food.radius)
+            if food_rect in nearby_food_rects and \
+                    self.distance(
+                        self.x, self.y, food.x, food.y) <= food.radius:
+                self.desired_angle = math.atan2(
+                    food.y - self.y, food.x - self.x)
+                self.carrying_food = True
+                self.mode = "got_food_trying_to_return_home"
+                self.set_desired_direction_from_pheromones(
+                    pheromone_grid, quadtree=quadtree, goto='nest')
+                break
+
+    def detect_nest(self):
+        """
+        Detect the nest and update the ant's state accordingly.
+        """
+        if self.distance(self.x, self.y, nest.x, nest.y) <= nest.radius \
+                and self.carrying_food:
+            self.carrying_food = False
+            self.mode = "looking_for_food"
+
+    def leave_pheromone_trail(self, pheromone_grid: PheromoneGrid):
+        """
+        Leave a pheromone trail based on the ant's current mode.
+
+        Parameters
+        ----------
+        pheromone_grid : PheromoneGrid
+            The pheromone grid.
+        """
+        if self.mode == "looking_for_food":
+            pheromone_grid.grid_nest[int(self.x)][int(self.y)] = 255
+            pheromone_grid.updated_cells.add((int(self.x), int(self.y)))
+        elif self.mode == "got_food_trying_to_return_home":
+            pheromone_grid.grid_food[int(self.x)][int(self.y)] = 255
+            pheromone_grid.updated_cells.add((int(self.x), int(self.y)))
+
+    def set_desired_direction_from_pheromones(
+            self, pheromone_grid: PheromoneGrid, quadtree: Quadtree, goto: str = 'food'):
+        """
+        Set the desired direction based on the pheromone trails.
+
+        Parameters
+        ----------
+        pheromone_grid : PheromoneGrid
+            The pheromone grid.
+        """
+        if goto == 'nest':
+            self.desired_angle = math.atan2(
+                nest.y - self.y, nest.x - self.x)
+            global ANT_RND_RATE
+        query_rect = pygame.Rect(self.x - 20, self.y - 20, 40, 40)
+        nearby_items = quadtree.retrieve(query_rect)
+
+        max_pheromone_value = 0
+        current_grid = pheromone_grid.grid_food if \
+            self.mode == "looking_for_food" else pheromone_grid.grid_nest
+        for item, rect in nearby_items:  # Unpack the tuple here
+            nx, ny = rect[0] + rect[2] / 2, rect[1] + rect[3] / 2
+            if current_grid[int(nx)][int(ny)] > max_pheromone_value:
+                max_pheromone_value = current_grid[int(nx)][int(ny)]
+                self.desired_angle = math.atan2(ny - self.y, nx - self.x)
+
+    def is_inside_cone(self, point_x, point_y):
+        cone_angle = math.pi / 8
+        cone_length = self.view_distance
+
+        left_angle = self.angle - cone_angle / 2
+        right_angle = self.angle + cone_angle / 2
+
+        rel_x, rel_y = point_x - self.x, point_y - self.y
+        point_distance = math.sqrt(rel_x ** 2 + rel_y ** 2)
+        point_angle = math.atan2(rel_y, rel_x)
+
+        return left_angle <= point_angle <= right_angle and\
+            point_distance <= cone_length
+
+
+def create_radial_gradient(width, height, color, radius):
+    """Create a surface with a radial gradient."""
+    surface = pygame.Surface((width, height), pygame.SRCALPHA)
+    center = (width / 2, height / 2)
+    for x in range(width):
+        for y in range(height):
+            distance = math.sqrt((x - center[0])**2 + (y - center[1])**2)
+            alpha = 255 * max(0, (radius - distance) / radius)
+            surface.set_at((x, y), (color[0], color[1], color[2], alpha))
+    return surface
+
+
+nest = Nest(SCREEN[0]/2, (SCREEN[1]/2))
+
+ants = [Ant(nest.x, nest.y) for _ in range(ANTS_COUNT)]
+food_sources = [FoodSource(random.randint(
+    FOOD_SOURCE_RADIUS, (SCREEN[0]-FOOD_SOURCE_RADIUS)),
+    random.randint(FOOD_SOURCE_RADIUS, (SCREEN[1]-FOOD_SOURCE_RADIUS))
+) for _ in range(FOOD_SOURCE_COUNT)]
+
+pheromone_grid = PheromoneGrid()
+quadtree = Quadtree(0, 0, SCREEN[0], SCREEN[1], 4, 4)
+# Insert food_sources into quadtree
+for food in food_sources:
+    food_rect = pygame.Rect(food.x - FOOD_SOURCE_RADIUS, food.y -
+                            FOOD_SOURCE_RADIUS, FOOD_SOURCE_RADIUS * 2,
+                            FOOD_SOURCE_RADIUS * 2)
+    quadtree.insert(food, food_rect)
+
+running = True
+while running:
+    for event in pygame.event.get():
+        if event.type == pygame.QUIT:
+            running = False
+
+    for ant in ants:
+        ant.update(food_sources, pheromone_grid, quadtree)
+
+    pheromone_grid.update()
+    screen.fill((0, 0, 0))
+    nest.draw(screen)
+    for ant in ants:
+        ant.draw(screen)
+    for food in food_sources:
+        food.draw(screen)
+
+    pheromone_grid.draw(screen)
+
+    pygame.display.flip()
+    clock.tick(FPS)
+
+pygame.quit()
